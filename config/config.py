@@ -36,7 +36,7 @@ WAJIB_JOIN = list(
         "WAJIB_JOIN", "EjaKentang" 
     ).split() 
 )
-USENAME_OWNER = os.environ.get("USENAME_OWNER", "@DoiAnda")
+USENAME_OWNER = os.environ.get("USENAME_OWNER", "@iwan588")
 API_ID = int(os.environ.get("API_ID", 34936251))
 MAX_BOT = int(os.environ.get("MAX_BOT", 100))
 
