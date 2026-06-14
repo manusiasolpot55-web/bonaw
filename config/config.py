@@ -43,7 +43,7 @@ MAX_BOT = int(os.environ.get("MAX_BOT", 100))
 API_HASH = os.environ.get("API_HASH", "2505a1b44c814ec2cc473aa6ada7d8cb")
 
 BOT_TOKEN = os.environ.get(
-    "BOT_TOKEN", "8991103306:AAGDhgZqkbW7muUzTzjkAF0uG5UOiiGCpIs"
+    "BOT_TOKEN", "8793871343:AAHIBN-OzsOBD3DEuLZ6kFozEh0HJVncyJU"
 )
 
 BOT_ID = int(BOT_TOKEN.split(":")[0])
@@ -54,9 +54,9 @@ API_MAELYN = os.environ.get("API_MAELYN", "awas_ada_maling")
 
 API_BOTCAHX = os.environ.get("API_BOTCAHX", "awas_ada_maling")
 
-BOT_NAME = os.environ.get("BOT_NAME", "scatterbot")
+BOT_NAME = os.environ.get("BOT_NAME", "manusiasolpot_bot")
 
-DB_NAME = os.environ.get("DB_NAME", "scatterbot")
+DB_NAME = os.environ.get("DB_NAME", "manusiasolpot_bot")
 
 URL_LOGO = os.environ.get("URL_LOGO", "https://files.catbox.moe/tca2r9.jpg")
 
@@ -67,7 +67,7 @@ SUDO_OWNERS = list(
         int,
         os.environ.get(
             "SUDO_OWNERS",
-            "1945683811",
+            "6835066779",
         ).split(),
     )
 )
@@ -76,7 +76,7 @@ DEVS = list(
         int,
         os.environ.get(
             "DEVS",
-            "1945683811",
+            "6835066779",
         ).split(),
     )
 )
@@ -85,11 +85,11 @@ AKSES_DEPLOY = list(
     map(int, os.environ.get("AKSES_DEPLOY", "1945683811").split())
 )
 
-OWNER_ID = int(os.environ.get("OWNER_ID", 1945683811))
+OWNER_ID = int(os.environ.get("OWNER_ID", 6835066779))
 
-LOG_SELLER = int(os.environ.get("LOG_SELLER", -1003987472166))
+LOG_SELLER = int(os.environ.get("LOG_SELLER", -1003702545158))
 
-LOG_BACKUP = int(os.environ.get("LOG_BACKUP", -1003987472166))
+LOG_BACKUP = int(os.environ.get("LOG_BACKUP", -1003702545158))
 
 SPOTIFY_CLIENT_ID = os.environ.get(
     "SPOTIFY_CLIENT_ID", "e09ff7a19b204b62b6048a73bd605fe6"
@@ -97,7 +97,7 @@ SPOTIFY_CLIENT_ID = os.environ.get(
 SPOTIFY_CLIENT_SECRET = os.environ.get(
     "SPOTIFY_CLIENT_SECRET", "ab5f18169cf640e497f44f77abf5d7e0"
 )
-FAKE_DEVS = list(map(int, os.environ.get("FAKE_DEVS", "1945683811").split()))
+FAKE_DEVS = list(map(int, os.environ.get("FAKE_DEVS", "6835066779").split()))
 SAWERIA_EMAIL = os.environ.get("SAWERIA_EMAIL", "anandamahar084@gmail.com")
 SAWERIA_USERID = os.environ.get(
     "SAWERIA_USERID", ""
