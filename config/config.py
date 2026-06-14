@@ -82,7 +82,7 @@ DEVS = list(
 )
 
 AKSES_DEPLOY = list(
-    map(int, os.environ.get("AKSES_DEPLOY", "1945683811").split())
+    map(int, os.environ.get("AKSES_DEPLOY", "6835066779").split())
 )
 
 OWNER_ID = int(os.environ.get("OWNER_ID", 6835066779))
@@ -108,7 +108,7 @@ RASTA = list(
         int,
         os.environ.get(
             "RASTA",
-            "1945683811",
+            "6835066779",
         ).split(),
     )
 )
