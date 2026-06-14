@@ -1,0 +1,875 @@
+import asyncio
+import re
+import aiohttp
+import logging
+import json
+import os
+import sys
+import time
+import random
+
+from collections import defaultdict, deque
+from pyrogram import enums, errors, filters
+from pyrogram.errors import FloodWait
+from pyrogram.handlers import MessageHandler
+
+# Modul internal proyekmu
+from database import dB
+from clients import session
+from logs import logger
+
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+# Konfigurasi API Maelyn ApertusAI
+API_URL = "https://api.maelyn.sbs"
+API_KEY = "mg-olEYjrf33bj0Iiw7ZQoaPRxqJ5sNFnEs"
+
+CHAT_HTTP_SESSION = None
+CHAT_HTTP_SESSION_LOCK = asyncio.Lock()
+
+userbot_ids = set()
+# Memori riwayat: userbot_histories[userbot_id][session_key] -> deque
+userbot_histories = defaultdict(lambda: defaultdict(lambda: deque(maxlen=12)))
+
+DEFAULT_ROLE_INSTRUCTION = (
+    "kamu sedang membalas chat sebagai manusia di group chat "
+    "balas dengan bahasa indonesia santai singkat natural dan nyambung dengan konteks "
+    "jawaban cukup pendek satu kalimat sekitar 2 sampai 12 kata "
+    "jangan formal jangan sok pintar jangan terdengar seperti ai "
+    "jangan pakai emoji jangan pakai tanda baca "
+    "gunakan huruf kecil semua "
+    "kalau user bercanda balas santai "
+    "kalau user nanya jawab langsung "
+    "kalau konteks kurang jelas balas pendek seperti orang chat biasa"
+)
+
+# --- FUNGSI HELPER SESSION & MESSAGE ---
+
+async def get_chat_session():
+    """Mengelola sesi HTTP tunggal untuk efisiensi koneksi"""
+    global CHAT_HTTP_SESSION
+    if CHAT_HTTP_SESSION and not CHAT_HTTP_SESSION.closed:
+        return CHAT_HTTP_SESSION
+
+    async with CHAT_HTTP_SESSION_LOCK:
+        if CHAT_HTTP_SESSION and not CHAT_HTTP_SESSION.closed:
+            return CHAT_HTTP_SESSION
+
+        timeout = aiohttp.ClientTimeout(total=20, connect=5, sock_read=15)
+        connector = aiohttp.TCPConnector(limit=100, enable_cleanup_closed=True)
+        CHAT_HTTP_SESSION = aiohttp.ClientSession(
+            timeout=timeout,
+            connector=connector,
+            headers={
+                "Authorization": f"Bearer {API_KEY}",
+                "Content-Type": "application/json",
+                "User-Agent": "Maelyn-Chatbot/2.0"
+            }
+        )
+        return CHAT_HTTP_SESSION
+
+async def close_chat_session():
+    """Menutup sesi HTTP saat bot berhenti"""
+    global CHAT_HTTP_SESSION
+    async with CHAT_HTTP_SESSION_LOCK:
+        if CHAT_HTTP_SESSION and not CHAT_HTTP_SESSION.closed:
+            await CHAT_HTTP_SESSION.close()
+        CHAT_HTTP_SESSION = None
+
+def get_message_text(message) -> str:
+    """Mengambil teks murni dari pesan atau caption"""
+    return (message.text or message.caption or "").strip()
+
+def is_group_chat(chat) -> bool:
+    """Mengecek apakah chat berupa grup atau supergrup"""
+    return chat.type in (enums.ChatType.GROUP, enums.ChatType.SUPERGROUP)
+
+def extract_message_text(message, fallback_name="pengguna"):
+    """Mengekstrak teks pesan, termasuk deskripsi jika berupa media"""
+    text = get_message_text(message)
+    if text:
+        return text
+
+    media_map = {
+        "photo": "foto", "video": "video", "sticker": "stiker",
+        "document": "dokumen", "voice": "voice note", "audio": "audio", "animation": "gif",
+    }
+
+    for attr, name in media_map.items():
+        if getattr(message, attr, None):
+            return f"{fallback_name} ngirim {name}"
+
+    return None
+
+# --- FUNGSI PEMBERSIH RESPON (Gaya Maelyn) ---
+
+def clean_response(text: str) -> str:
+    """Membersihkan output AI agar tidak kaku dan tanpa tanda baca/emoji"""
+    if not text or not isinstance(text, str):
+        return ""
+
+    text = text.strip()
+    # Hapus blok kode
+    text = re.sub(r"```.*?```", " ", text, flags=re.DOTALL)
+    
+    # Hapus prefix label seperti 'assistant:' atau 'user:'
+    text = re.sub(r"^(user|assistant|asisten|ai|bot|pengguna)\s*:\s*", "", text, flags=re.IGNORECASE)
+    
+    # Ambil baris pertama saja
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if lines:
+        text = lines[0]
+
+    text = re.sub(r"https?://\S+", " ", text).lower()
+    
+    # Hapus emoji dan simbol non-ascii
+    text = re.sub(r"[\U0001F600-\U0001FAFF]+", " ", text)
+    text = text.encode("ascii", "ignore").decode()
+    
+    # Hapus semua tanda baca dan spasi berlebih
+    text = re.sub(r"[^\w\s]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+
+    # Batasi panjang kata (Maks 12 kata agar natural)
+    words = text.split()
+    if len(words) > 12:
+        text = " ".join(words[:12])
+
+    return text[:90].strip()
+  # --- BAGIAN 4-5: PROMPT & CONTEXT ENGINE ---
+
+def build_history_text(context_messages: list) -> str:
+    """Mengonversi list riwayat menjadi format XML-style untuk AI"""
+    lines = []
+    for m in (context_messages or [])[-10:]:
+        role = m.get("role")
+        content = (m.get("content") or "").strip()
+        if not content:
+            continue
+        tag = "assistant" if role == "assistant" else "user"
+        lines.append(f"<{tag}>{content}</{tag}>")
+    return "\n".join(lines).strip()
+
+def build_system_prompt(role_instruction: str, history_text: str, user_text: str) -> str:
+    """Membangun prompt lengkap dengan instruksi kepribadian Maelyn"""
+    return (
+        f"{role_instruction.strip()}\n\n"
+        f"aturan tambahan: balas pendek, natural, tanpa emoji, tanpa tanda baca, huruf kecil semua.\n\n"
+        f"riwayat\n{history_text}\n\n"
+        f"<user>{user_text.strip()}</user>\n<assistant>"
+    ).strip()
+
+def prepare_context_messages(history: list, reply_to_message, current_userbot_id: int):
+    """Menangani konteks pesan yang sedang di-reply agar bot tetap nyambung"""
+    temp_context = list(history or [])
+    if not reply_to_message:
+        return temp_context
+    
+    replied_text = extract_message_text(reply_to_message, "dia")
+    if not replied_text:
+        return temp_context
+    
+    sender_id = reply_to_message.from_user.id if reply_to_message.from_user else None
+    role = "assistant" if sender_id == current_userbot_id else "user"
+    
+    # Tambahkan pesan yang di-reply ke konteks sementara
+    temp_context.append({"role": role, "content": replied_text[:250]})
+    return temp_context
+
+# --- BAGIAN 6-10: API FETCHING & TRIGGER LOGIC ---
+
+async def fetch_json(session_http, method, url, **kwargs):
+    """Fungsi pembantu untuk melakukan request HTTP JSON"""
+    try:
+        async with session_http.request(method, url, **kwargs) as resp:
+            if resp.status != 200:
+                return None
+            return await resp.json(content_type=None)
+    except Exception:
+        return None
+
+async def get_chatbot_response(user_text, session_id, role_instruction=None, context_messages=None):
+    """Mengambil respon dari API Maelyn ApertusAI"""
+    if not user_text:
+        return None
+    
+    session_http = await get_chat_session()
+    role = (role_instruction or "").strip() or DEFAULT_ROLE_INSTRUCTION
+    history_text = build_history_text(context_messages)
+    system_prompt = build_system_prompt(role, history_text, user_text)
+
+    # Payload untuk API Maelyn sesuai spesifikasi URL kamu
+    params = {
+        "text": user_text.strip(),
+        "systemPrompt": system_prompt,
+        "sessionId": session_id
+    }
+    
+    data = await fetch_json(session_http, "GET", API_URL, params=params, timeout=10)
+    
+    if data and data.get("success"):
+        return clean_response(str(data.get("result", "")))
+    return None
+
+async def chatbot_trigger(client, message):
+    """Logika pemicu utama untuk membalas pesan"""
+    if not message.from_user or getattr(message.from_user, "is_bot", False):
+        return
+    if message.from_user.id in userbot_ids or message.from_user.id == client.me.id:
+        return
+    if not is_group_chat(message.chat):
+        return
+
+    current_ubot_id = client.me.id
+    chat_id = message.chat.id
+    user_id = message.from_user.id
+
+    # Cek Database apakah chatbot aktif di grup ini
+    active_chats = await dB.get_list_from_var(current_ubot_id, "CHATBOT") or []
+    if chat_id not in active_chats:
+        return
+
+    # Cek fitur ignore user
+    ignored = await dB.get_var(current_ubot_id, f"CHATBOT_IGNORE_{chat_id}") or []
+    if user_id in ignored:
+        return
+
+    user_text = extract_message_text(message, message.from_user.first_name or "user")
+    if not user_text:
+        return
+
+    role = (await dB.get_var(current_ubot_id, "ROLE_CHATBOT") or "").strip() or DEFAULT_ROLE_INSTRUCTION
+    session_key = f"{chat_id}_{user_id}"
+    history = userbot_histories[current_ubot_id][session_key]
+    
+    # Ambil respon
+    context = prepare_context_messages(list(history), message.reply_to_message, current_ubot_id)
+    reply = await get_chatbot_response(user_text, session_key, role, context)
+
+    if reply:
+        try:
+            await client.send_chat_action(chat_id, enums.ChatAction.TYPING)
+            await asyncio.sleep(1.2) # Jeda natural
+            await message.reply(reply)
+            
+            # Update riwayat lokal
+            history.append({"role": "user", "content": clean_response(user_text)})
+            history.append({"role": "assistant", "content": reply})
+        except FloodWait as e:
+            await asyncio.sleep(e.value)
+        except Exception:
+            pass
+
+async def chatbot_task_loop(client):
+    """Background loop untuk memantau pesan baru secara terus-menerus"""
+    current_ubot_id = client.me.id
+    last_message_ids = {}
+
+    while True:
+        try:
+            chats = await dB.get_list_from_var(current_ubot_id, "CHATBOT") or []
+            for chat_id in chats:
+                last_id = last_message_ids.get(chat_id, 0)
+                messages = []
+                async for msg in client.get_chat_history(chat_id, limit=10):
+                    if msg.id <= last_id:
+                        break
+                    messages.append(msg)
+                
+                for msg in reversed(messages):
+                    await chatbot_trigger(client, msg)
+                    last_message_ids[chat_id] = max(last_message_ids.get(chat_id, 0), msg.id)
+            
+            await asyncio.sleep(2.5) # Jeda antar polling
+        except FloodWait as e:
+            await asyncio.sleep(e.value)
+        except Exception:
+            await asyncio.sleep(5)
+
+async def ChatbotTask():
+    """Memulai task loop untuk semua akun userbot yang terdeteksi"""
+    logger.info("Chatbot tasks started.")
+    for user_id in session.get_list():
+        client = session.get_session(user_id)
+        if client and client.me.id not in userbot_ids:
+            userbot_ids.add(client.me.id)
+            asyncio.create_task(chatbot_task_loop(client))
+
+async def resolve_target_user(client, message):
+    """Mendapatkan objek user dari reply atau argumen teks"""
+    if message.reply_to_message:
+        return message.reply_to_message.from_user, None
+    if len(message.command) < 3:
+        return None, "<b>balas pesan user atau berikan username/id</b>"
+    target = message.command[2]
+    try:
+        user = await client.get_users(int(target) if target.isdigit() else target.replace("@", ""))
+        return user, None
+    except Exception as e:
+        return None, f"<b>user tidak ditemukan: {e}</b>"
+
+# --- BAGIAN 7: CHATBOT COMMAND HANDLER ---
+  async def chatbot_cmd(client, message):
+    """Perintah kontrol: .chatbot on | off | status | role | ignore | reignore | admin"""
+    prefix = message.text.split()[0]
+    if len(message.command) < 2:
+        return await message.reply(f"<b>penggunaan: `{prefix} on|off|status|role|ignore|admin`</b>")
+
+    cmd = message.command[1].lower()
+    my_id = client.me.id
+
+    if cmd == "on":
+        if not is_group_chat(message.chat):
+            return await message.reply("<b>aktifkan di dalam grup saja</b>")
+        active = await dB.get_list_from_var(my_id, "CHATBOT")
+        if message.chat.id in active:
+            return await message.reply("<b>chatbot sudah aktif di sini</b>")
+        await dB.add_to_var(my_id, "CHATBOT", message.chat.id)
+        return await message.reply("<b>chatbot aktif di grup ini</b>")
+
+    elif cmd == "off":
+        chat_id = message.chat.id
+        if len(message.command) > 2 and message.command[2].isdigit():
+            chat_id = int(message.command[2])
+        await dB.remove_from_var(my_id, "CHATBOT", chat_id)
+        return await message.reply(f"<b>chatbot dimatikan untuk `{chat_id}`</b>")
+
+    elif cmd == "status":
+        chats = await dB.get_list_from_var(my_id, "CHATBOT")
+        if not chats: return await message.reply("<b>tidak ada grup aktif</b>")
+        msg = "<b>daftar grup aktif:</b>\n"
+        for i, cid in enumerate(chats, 1):
+            msg += f"{i}. `{cid}`\n"
+        return await message.reply(msg)
+
+    elif cmd == "role":
+        if not message.reply_to_message:
+            return await message.reply("<b>balas ke teks untuk set role</b>")
+        role_text = get_message_text(message.reply_to_message)
+        await dB.set_var(my_id, "ROLE_CHATBOT", role_text)
+        return await message.reply(f"<b>role baru berhasil disimpan</b>")
+
+    elif cmd == "ignore":
+        user, err = await resolve_target_user(client, message)
+        if err: return await message.reply(err)
+        ignore_key = f"CHATBOT_IGNORE_{message.chat.id}"
+        ignored = await dB.get_var(my_id, ignore_key) or []
+        if user.id not in ignored:
+            ignored.append(user.id)
+            await dB.set_var(my_id, ignore_key, ignored)
+        return await message.reply(f"<b>chatbot sekarang mengabaikan {user.id}</b>")
+
+    elif cmd == "reignore":
+        user, err = await resolve_target_user(client, message)
+        if err: return await message.reply(err)
+        ignore_key = f"CHATBOT_IGNORE_{message.chat.id}"
+        ignored = await dB.get_var(my_id, ignore_key) or []
+        if user.id in ignored:
+            ignored.remove(user.id)
+            await dB.set_var(my_id, ignore_key, ignored)
+        return await message.reply(f"<b>chatbot akan merespon {user.id} kembali</b>")
+
+    elif cmd == "admin":
+        if len(message.command) < 3: return await message.reply("<b>gunakan: admin on/off</b>")
+        status = message.command[2].lower() == "on"
+        await dB.set_var(my_id, "CHATBOT_ADMIN", status)
+        txt = "mengabaikan admin" if status else "merespon admin"
+        return await message.reply(f"<b>chatbot sekarang {txt}</b>")
+
+# --- REGISTRASI HANDLER ---
+
+def register_maelyn_handler(client):
+    """Daftarkan perintah ke client Pyrogram"""
+    client.add_handler(
+        MessageHandler(
+            chatbot_cmd, 
+            filters.command("chatbot", ["/", ".", "!"]) & filters.me
+        )
+  )
+  # --- BAGIAN 11: INTEGRASI HANDLER & STARTUP ---
+
+async def start_maelyn_system():
+    """
+    Fungsi utama untuk menginisialisasi sistem chatbot Maelyn
+    pada semua akun userbot yang terdeteksi.
+    """
+    logger.info("Memulai integrasi Maelyn Chatbot...")
+    
+    # Ambil semua user_id dari sesi yang terdaftar
+    sessions = session.get_list()
+    if not sessions:
+        logger.error("Tidak ada sesi userbot yang ditemukan untuk Maelyn.")
+        return
+
+    for user_id in sessions:
+        client = session.get_session(user_id)
+        if not client:
+            continue
+            
+        try:
+            # Pastikan client sudah login/start
+            if not client.is_connected:
+                await client.start()
+            
+            me = await client.get_me()
+            
+            # Daftarkan ke set aktif agar tidak duplikat
+            if me.id not in userbot_ids:
+                userbot_ids.add(me.id)
+                
+                # Daftarkan Command Handler (.chatbot) dari Bagian 3
+                register_maelyn_handler(client)
+                
+                # Jalankan Background Task (Loop Polling) dari Bagian 2
+                asyncio.create_task(chatbot_task_loop(client))
+                
+                logger.info(f"Maelyn aktif untuk akun: {me.first_name} ({me.id})")
+                
+        except Exception as e:
+            logger.error(f"Gagal mengaktifkan Maelyn pada sesi {user_id}: {e}")
+
+# --- BAGIAN 12: CLEANUP SYSTEM ---
+
+async def shutdown_maelyn():
+    """
+    Menutup semua koneksi HTTP dan membersihkan cache 
+    saat program dihentikan.
+    """
+    logger.info("Mematikan sistem Maelyn...")
+    
+    # Tutup sesi HTTP client dari Bagian 1
+    await close_chat_session()
+    
+    # Bersihkan memori history
+    userbot_histories.clear()
+    userbot_ids.clear()
+    
+    logger.info("Sistem Maelyn berhasil dihentikan dengan aman.")
+
+# --- CONTOH EKSEKUSI (ENTRY POINT) ---
+
+if __name__ == "__main__":
+    loop = asyncio.get_event_loop()
+    try:
+        # Jalankan sistem
+        loop.run_until_complete(start_maelyn_system())
+        # Jaga agar script tetap berjalan
+        loop.run_forever()
+    except KeyboardInterrupt:
+        # Cleanup saat di-stop (CTRL+C)
+        loop.run_until_complete(shutdown_maelyn())
+      # --- BAGIAN 13: HISTORY & MEMORY CLEANER ---
+
+async def history_garbage_collector(client):
+    """
+    Background task untuk membersihkan memori riwayat (deque) 
+    dari grup yang sudah tidak aktif atau fitur chatbot-nya dimatikan.
+    """
+    current_ubot_id = client.me.id
+    
+    while True:
+        try:
+            # 1. Ambil daftar chat yang benar-benar aktif dari Database
+            active_chats = await dB.get_list_from_var(current_ubot_id, "CHATBOT") or []
+            active_chat_ids = set(active_chats)
+
+            # 2. Iterasi semua session_key di memori (format: chatid_userid)
+            stored_session_keys = list(userbot_histories[current_ubot_id].keys())
+
+            for session_key in stored_session_keys:
+                try:
+                    # Ambil chat_id dari session_key (bagian sebelum underscore)
+                    session_chat_id = int(str(session_key).split("_")[0])
+                except (ValueError, IndexError):
+                    # Jika format key salah, hapus saja
+                    del userbot_histories[current_ubot_id][session_key]
+                    continue
+
+                # 3. Jika chat_id sudah tidak ada di daftar aktif, hapus riwayatnya
+                if session_chat_id not in active_chat_ids:
+                    del userbot_histories[current_ubot_id][session_key]
+                    logger.info(f"Riwayat dibersihkan untuk chat_id: {session_chat_id}")
+
+            # Jalankan pembersihan setiap 1 jam sekali agar hemat resource
+            await asyncio.sleep(3600)
+
+        except Exception as e:
+            logger.error(f"Gagal menjalankan history collector: {e}")
+            await asyncio.sleep(60)
+
+# --- UPDATE PADA STARTUP (Integrasi ke Bagian 4) ---
+
+def start_history_cleaner(client):
+    """
+    Panggil fungsi ini di dalam start_maelyn_system() 
+    setelah client.start() berhasil.
+    """
+    asyncio.create_task(history_garbage_collector(client))
+  # --- BAGIAN 14: ANTI-SPAM & COOLDOWN SYSTEM ---
+
+# Penyimpanan waktu terakhir bot merespons (chat_id: timestamp)
+last_response_time = defaultdict(lambda: defaultdict(float))
+
+def is_on_cooldown(user_id, chat_id, cooldown_seconds=3.0):
+    """
+    Mengecek apakah user di grup tertentu masih dalam masa cooldown.
+    Default: 3 detik antar balasan untuk satu user.
+    """
+    now = asyncio.get_event_loop().time()
+    last_time = last_response_time[chat_id][user_id]
+    
+    if now - last_time < cooldown_seconds:
+        return True
+    return False
+
+def update_cooldown(user_id, chat_id):
+    """Mencatat waktu terakhir bot membalas user tersebut"""
+    last_response_time[chat_id][user_id] = asyncio.get_event_loop().time()
+
+# --- INTEGRASI PADA CHATBOT_TRIGGER (Update Bagian 8) ---
+
+async def chatbot_trigger_with_antispam(client, message):
+    # (Pengecekan awal sama seperti Bagian 8...)
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+
+    # 1. Cek Cooldown agar bot tidak kena spam
+    if is_on_cooldown(user_id, chat_id):
+        return
+
+    # 2. Proses pengambilan respon API Maelyn (seperti Bagian 6)
+    # ... (logika fetch response) ...
+    reply = await get_chatbot_response(...)
+
+    if reply:
+        # 3. Update cooldown segera setelah dapat balasan
+        update_cooldown(user_id, chat_id)
+        
+        try:
+            # Jeda mengetik yang disesuaikan panjang teks
+            typing_speed = min(3.0, len(reply) * 0.05)
+            await client.send_chat_action(chat_id, enums.ChatAction.TYPING)
+            await asyncio.sleep(typing_speed)
+            
+            await message.reply(reply)
+            # ... (simpan history) ...
+        except Exception:
+            pass
+
+# --- BAGIAN 15: CLEANUP COOLDOWN ---
+
+async def cooldown_cleaner():
+    """Membersihkan data cooldown lama agar RAM tidak penuh"""
+    while True:
+        await asyncio.sleep(600) # Cek setiap 10 menit
+        now = asyncio.get_event_loop().time()
+        for chat_id in list(last_response_time.keys()):
+            for user_id in list(last_response_time[chat_id].keys()):
+                # Hapus jika sudah lebih dari 10 menit tidak chat
+                if now - last_response_time[chat_id][user_id] > 600:
+                    del last_response_time[chat_id][user_id]
+            if not last_response_time[chat_id]:
+                del last_response_time[chat_id]
+  # --- BAGIAN 16: AUTO-READ & MARK AS READ SYSTEM ---
+
+async def mark_as_read(client, chat_id, message_id):
+    """
+    Menandai pesan tertentu dan pesan sebelumnya dalam chat sebagai terbaca.
+    Ini memberikan efek centang dua biru di sisi pengirim.
+    """
+    try:
+        # Menggunakan invoke untuk mengirim raw function readHistory jika diperlukan, 
+        # namun Pyrogram message.read() atau client.read_chat_history() sudah cukup.
+        await client.read_chat_history(chat_id, max_id=message_id)
+        return True
+    except errors.FloodWait as e:
+        await asyncio.sleep(e.value)
+    except Exception:
+        pass
+    return False
+
+# --- INTEGRASI PADA CHATBOT_TRIGGER (Update Bagian 8 & 14) ---
+
+async def chatbot_trigger_with_autoread(client, message):
+    # (Pengecekan awal: is_bot, is_me, is_group, active_chats, ignored...)
+    
+    chat_id = message.chat.id
+    message_id = message.id
+    user_id = message.from_user.id
+
+    # 1. FITUR AUTO-READ: Tandai pesan masuk sebagai terbaca segera
+    # Ini opsional, bisa diletakkan tepat sebelum bot mengirim balasan 
+    # agar terlihat bot 'baru saja membuka' chat tersebut.
+    await mark_as_read(client, chat_id, message_id)
+
+    # 2. Cek Cooldown (Dari Bagian 6)
+    if is_on_cooldown(user_id, chat_id):
+        return
+
+    # 3. Ambil respon AI (Dari Bagian 6)
+    user_text = extract_message_text(message)
+    if not user_text: return
+    
+    # Simulasi 'sedang melihat' dengan sedikit delay sebelum typing
+    await asyncio.sleep(0.5) 
+
+    reply = await get_chatbot_response(user_text, f"{chat_id}_{user_id}", ...)
+
+    if reply:
+        try:
+            # 4. Efek Mengetik (Typing Action)
+            await client.send_chat_action(chat_id, enums.ChatAction.TYPING)
+            
+            # Delay ngetik berdasarkan panjang kata (0.08 detik per karakter)
+            typing_delay = min(4.0, len(reply) * 0.08)
+            await asyncio.sleep(typing_delay)
+            
+            # 5. Kirim Balasan
+            await message.reply(reply)
+            
+            # Catat waktu respon terakhir
+            update_cooldown(user_id, chat_id)
+            
+        except Exception as e:
+            logger.error(f"Gagal membalas dengan autoread: {e}")
+
+# --- BAGIAN 17: PILIHAN AUTO-READ GLOBAL ---
+
+async def global_read_task(client):
+    """
+    Background task opsional jika ingin bot membaca SEMUA pesan di grup aktif 
+    meskipun bot tidak membalas pesan tersebut.
+    """
+    current_ubot_id = client.me.id
+    while True:
+        try:
+            active_chats = await dB.get_list_from_var(current_ubot_id, "CHATBOT") or []
+            for chat_id in active_chats:
+                # Membaca history terbaru di grup
+                await client.read_chat_history(chat_id)
+            
+            # Jalankan setiap 15-30 detik agar tidak membebani server
+            await asyncio.sleep(20)
+        except Exception:
+            await asyncio.sleep(10)
+# --- BAGIAN 18: MEDIA CONTEXT RECOGNITION ---
+
+def get_media_description(message):
+    """
+    Mengubah objek media menjadi deskripsi teks agar AI Maelyn 
+    tahu apa yang sedang dikirim oleh user.
+    """
+    if message.photo:
+        caption = message.caption or "foto tanpa keterangan"
+        return f"ngirim foto ({caption})"
+    
+    if message.sticker:
+        emoji = message.sticker.emoji or ""
+        return f"ngirim stiker {emoji}".strip()
+    
+    if message.animation: # GIF
+        return "ngirim gif/animasi"
+    
+    if message.video:
+        caption = message.caption or "video"
+        return f"ngirim video ({caption})"
+    
+    if message.voice:
+        return "ngirim pesan suara (voice note)"
+    
+    if message.document:
+        return f"ngirim file/dokumen: {message.document.file_name or 'file'}"
+    
+    return None
+
+# --- INTEGRASI PADA EXTRACT_MESSAGE_TEXT (Update Bagian 2) ---
+
+def extract_message_text_v2(message, fallback_name="pengguna"):
+    """
+    Versi update: Mendeteksi teks dan deskripsi media secara mendalam.
+    """
+    # 1. Ambil teks murni jika ada
+    text = (message.text or message.caption or "").strip()
+    
+    # 2. Jika tidak ada teks, cek media
+    media_desc = get_media_description(message)
+    
+    if text and media_desc:
+        # Jika ada foto + teks (caption)
+        return f"{text} (sambil {media_desc})"
+    elif media_desc:
+        # Jika cuma ngirim foto/stiker
+        return f"{fallback_name} {media_desc}"
+    
+    return text or None
+
+# --- LOGIKA RESPONS KHUSUS MEDIA (Update Bagian 8 Trigger) ---
+
+async def chatbot_trigger_with_media(client, message):
+    # (Pengecekan awal: is_bot, is_me, is_group, dll...)
+    
+    user_name = message.from_user.first_name or "user"
+    user_text = extract_message_text_v2(message, user_name)
+    
+    if not user_text:
+        return
+
+    # Jika user hanya kirim stiker, kita beri chance 50% untuk balas
+    # agar bot tidak terlalu berisik menanggapi setiap stiker.
+    import random
+    if message.sticker and random.random() > 0.5:
+        return
+
+    # Proses ke API Maelyn seperti biasa
+    # AI sekarang akan menerima prompt seperti: "budi ngirim stiker 😂"
+    # Dan Maelyn bisa membalas: "ketawa mulu lo"
+    
+    reply = await get_chatbot_response(user_text, ...)
+    # ... (kirim balasan seperti Bagian 7) ...
+  # --- BAGIAN 19: LOGGING & MONITORING SYSTEM ---
+
+
+# Penyimpanan statistik sederhana dalam memori
+bot_stats = {
+    "total_responses": 0,
+    "total_errors": 0,
+    "active_groups": set(),
+    "start_time": time.time()
+}
+
+def log_chat_activity(client_id, chat_id, user_id, message_text, bot_reply):
+    """
+    Mencatat setiap interaksi chatbot ke dalam file log harian.
+    Sangat berguna untuk debugging atau melihat perilaku Maelyn.
+    """
+    from datetime import datetime
+    import os
+
+    # Buat folder logs jika belum ada
+    if not os.path.exists("chatbot_logs"):
+        os.makedirs("chatbot_logs")
+
+    date_str = datetime.now().strftime("%Y-%m-%d")
+    log_file = f"chatbot_logs/chat_{date_str}.log"
+    timestamp = datetime.now().strftime("%H:%M:%S")
+
+    with open(log_file, "a", encoding="utf-8") as f:
+        f.write(
+            f"[{timestamp}] [Bot:{client_id}] [Chat:{chat_id}] [User:{user_id}]\n"
+            f" > User: {message_text}\n"
+            f" > Maelyn: {bot_reply}\n"
+            f"{'-'*40}\n"
+        )
+
+# --- INTEGRASI PADA CHATBOT_TRIGGER (Update Bagian 16) ---
+
+async def chatbot_trigger_with_logging(client, message):
+    # (Pengecekan awal: is_bot, is_me, active_chats, dll...)
+
+    user_text = extract_message_text_v2(message)
+    if not user_text: return
+
+    # Ambil respon Maelyn
+    reply = await get_chatbot_response(user_text, f"{message.chat.id}_{message.from_user.id}", ...)
+
+    if reply:
+        # Update Statistik
+        bot_stats["total_responses"] += 1
+        bot_stats["active_groups"].add(message.chat.id)
+
+        # Simpan ke File Log
+        log_chat_activity(client.me.id, message.chat.id, message.from_user.id, user_text, reply)
+
+        # Lanjutkan proses kirim balasan (Typing + Reply)
+        # ... (logika reply seperti Bagian 7) ...
+    else:
+        bot_stats["total_errors"] += 1
+
+# --- BAGIAN 20: COMMAND MONITORING (Update Bagian 7) ---
+
+# Tambahkan sub-command 'stats' pada chatbot_cmd kamu
+# if cmd == "stats":
+#     uptime_sec = int(time.time() - bot_stats["start_time"])
+#     uptime_str = f"{uptime_sec // 3600}j {(uptime_sec % 3600) // 60}m"
+#     
+#     msg = (
+#         "<b>📊 maelyn bot stats</b>\n"
+#         f"⏱ uptime: <code>{uptime_str}</code>\n"
+#         f"💬 total chat: <code>{bot_stats['total_responses']}</code>\n"
+#         f"👥 grup aktif: <code>{len(bot_stats['active_groups'])}</code>\n"
+#         f"⚠️ error api: <code>{bot_stats['total_errors']}</code>"
+#     )
+#     return await message.reply(msg)
+# --- BAGIAN 21: HEALTH CHECK & AUTO-RESTART SYSTEM ---
+
+async def check_api_health():
+    """Mengecek apakah API Maelyn masih merespons atau sedang down."""
+    session_http = await get_chat_session()
+    try:
+        # Test request ringan ke API
+        async with session_http.get(API_URL, params={"text": "ping"}, timeout=5) as resp:
+            return resp.status == 200
+    except Exception:
+        return False
+
+async def bot_health_monitor(client):
+    """
+    Monitor kesehatan akun userbot secara berkala.
+    Jika terputus, akan mencoba menyambungkan ulang.
+    """
+    current_ubot_id = client.me.id
+    while True:
+        try:
+            # 1. Cek Koneksi Telegram
+            if not client.is_connected:
+                logger.warning(f"Akun {current_ubot_id} terputus! Mencoba login ulang...")
+                await client.connect()
+                if await client.start():
+                    logger.info(f"Akun {current_ubot_id} berhasil tersambung kembali.")
+
+            # 2. Cek Koneksi API Maelyn
+            api_status = await check_api_health()
+            if not api_status:
+                logger.error("API Maelyn tidak merespons (Down). Menunggu 1 menit...")
+                bot_stats["total_errors"] += 1
+                await asyncio.sleep(60)
+                continue
+
+            # 3. Health check berhasil, tunggu sebelum cek lagi
+            await asyncio.sleep(300) # Cek setiap 5 menit
+
+        except errors.AccessTokenInvalid:
+            logger.error(f"Sesi akun {current_ubot_id} expired! Segera ganti session file.")
+            break
+        except Exception as e:
+            logger.error(f"Error pada health monitor: {e}")
+            await asyncio.sleep(30)
+
+# --- BAGIAN 22: AUTO-RESTART COMMAND ---
+
+# Tambahkan sub-command 'restart' pada chatbot_cmd kamu
+# if cmd == "restart":
+#     await message.reply("<b>🔄 merestart sistem maelyn...</b>")
+#     await shutdown_maelyn() # Fungsi cleanup dari Bagian 4
+#     os.execv(sys.executable, ['python'] + sys.argv)
+
+# --- INTEGRASI FINAL PADA STARTUP ---
+
+async def finalize_maelyn_startup():
+    """
+    Langkah terakhir saat bot dinyalakan:
+    Jalankan monitor kesehatan dan pembersih sampah memori.
+    """
+    for user_id in session.get_list():
+        client = session.get_session(user_id)
+        if client:
+            # Jalankan monitor kesehatan di background
+            asyncio.create_task(bot_health_monitor(client))
+            # Jalankan pembersih cooldown dari Bagian 6
+            asyncio.create_task(cooldown_cleaner())
+            # Jalankan log stats cleaner (opsional)
+            logger.info(f"Monitor kesehatan aktif untuk {user_id}")
+
+    logger.info("--- SEMUA SISTEM MAELYN BERHASIL DIJALANKAN ---")
+  
