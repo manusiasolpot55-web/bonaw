@@ -37,10 +37,10 @@ WAJIB_JOIN = list(
     ).split() 
 )
 USENAME_OWNER = os.environ.get("USENAME_OWNER", "@iwan588")
-API_ID = int(os.environ.get("API_ID", 34936251))
+API_ID = int(os.environ.get("API_ID", 36890670))
 MAX_BOT = int(os.environ.get("MAX_BOT", 100))
 
-API_HASH = os.environ.get("API_HASH", "2505a1b44c814ec2cc473aa6ada7d8cb")
+API_HASH = os.environ.get("API_HASH", "1d39f767d739f7fb09b585d7b5815252")
 
 BOT_TOKEN = os.environ.get(
     "BOT_TOKEN", "8793871343:AAHIBN-OzsOBD3DEuLZ6kFozEh0HJVncyJU"
@@ -48,11 +48,11 @@ BOT_TOKEN = os.environ.get(
 
 BOT_ID = int(BOT_TOKEN.split(":")[0])
 
-API_GEMINI = os.environ.get("API_GEMINI", "AIzaSyAMSxIG6-WV_mOGm6BL9TtFpW7GOMVmz3g")
+API_GEMINI = os.environ.get("API_GEMINI", "")
 
-API_MAELYN = os.environ.get("API_MAELYN", "awas_ada_maling")
+API_MAELYN = os.environ.get("API_MAELYN", "")
 
-API_BOTCAHX = os.environ.get("API_BOTCAHX", "awas_ada_maling")
+API_BOTCAHX = os.environ.get("API_BOTCAHX", "")
 
 BOT_NAME = os.environ.get("BOT_NAME", "manusiasolpot_bot")
 
